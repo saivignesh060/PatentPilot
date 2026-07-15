@@ -109,12 +109,12 @@ flowchart LR
 |---|---|---|
 | **PubChem PUG REST** | SMILES validation, canonicalization, CID lookup, 2D fingerprint similarity search (`fastsimilarity_2d`) | Free, no key, offloads fingerprint/Tanimoto computation server-side — no need to run RDKit locally, keeps the stack pure Node. |
 | **SureChEMBL** | Structure-to-patent mapping — which patents disclose this or a similar structure | Purpose-built for exactly this: chemical structure → patent linkage. Primary structural-risk source. |
-| **USPTO PatentsView API** | Keyword/full-text search on target, indication, molecule name/synonyms | Free, well-documented, catches patents that discuss the compound by name/mechanism without a deposited structure in SureChEMBL — fills the gap structural search alone misses. **Note:** as of the current API version, requests require a free registered API key (`X-Api-Key` header) — the old fully-open version was discontinued May 1, 2025. Request the key at the start of the build (Section 15, Phase 0), not when you get to Phase 3 — issuance isn't always instant. |
+| **EPO Open Patent Services (OPS)** | Keyword/full-text search on target, indication, molecule name/synonyms — via INPADOC family data | Free "Non-paying" tier (3.5 GB/week), catches patents that discuss the compound by name/mechanism without a deposited structure in SureChEMBL. Registration is a plain email/password form at `developers.epo.org` — no government ID or ID.me verification, unlike USPTO's Open Data Portal (which now requires ID.me identity verification, and a passport-based video call for anyone outside the US). Bonus: EPO/INPADOC coverage spans patent families across the US, EP, WO and other offices, so this is broader than a US-only source, not narrower. |
 
 **Pipeline**
 1. Resolve SMILES → canonical SMILES + CID (PubChem).
 2. Structural candidates: PubChem similarity search → cross-reference resulting CIDs against SureChEMBL structure search.
-3. Keyword candidates: PatentsView full-text query built from target + indication + any PubChem synonyms for the molecule.
+3. Keyword candidates: EPO OPS CQL search (`ti=`, `ab=`, `pa=` fields) built from target + indication + any PubChem synonyms for the molecule.
 4. Merge both candidate sets, dedupe by patent number, fetch full metadata (title, abstract, assignee, date) for each.
 5. Score every candidate (Section 9) and return ranked list to the client.
 
@@ -232,13 +232,24 @@ Report {                          // Chain B output, per query
 - **Frontend:** React (Vite), TailwindCSS, React Query, React Router
 - **Backend:** Node.js, Express, Mongoose
 - **Database:** MongoDB
-- **AI:** LangChain (JS), LLM provider configurable via env (OpenAI / Gemini / Groq)
-- **Embeddings:** provider's embedding model (e.g., `text-embedding-3-small`), precomputed and cached per patent to avoid recompute
-- **External APIs:** PubChem PUG REST (free, no key), SureChEMBL REST API (free, no key), USPTO PatentsView API (free, but requires a registered `X-Api-Key` — request it on day one)
+- **AI:** LangChain (JS), LLM = `gemini-3.1-flash-lite` via the Gemini API
+- **Embeddings:** `gemini-embedding-2` via the Gemini API, precomputed and cached per patent to avoid recompute
+- **External APIs:** PubChem PUG REST (free, no key), SureChEMBL REST API (free, no key), EPO Open Patent Services / OPS (free "Non-paying" tier, email-registered Consumer Key + Secret, no government ID)
+
+**API keys needed (Phase 0):**
+| Env var | Where to get it | Notes |
+|---|---|---|
+| `GEMINI_API_KEY` | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) | One key covers **both** `gemini-3.1-flash-lite` (Chain A/B) and `gemini-embedding-2` (semantic scoring) — same Gemini API, same key. |
+| `EPO_OPS_CONSUMER_KEY` / `EPO_OPS_CONSUMER_SECRET` | `developers.epo.org/user/register` → choose "Non-paying" access → confirm via email → **My Apps** → Add a new App | Simple email/password registration, no ID.me or government ID. Used for OAuth2 to get a bearer token, then that token authenticates OPS search calls. 3.5 GB/week free, more than enough for a screening tool. |
+| `MONGODB_URI` | Local Docker container (recommended) or MongoDB Atlas free tier | See note below. |
+
+**Note on USPTO's Open Data Portal:** the PRD originally pointed at USPTO ODP for keyword search, but as of June 18, 2026 ODP requires ID.me identity verification for every API key — and for anyone outside the US, that means a passport-based video call. If you don't have a passport, that path is genuinely closed, not just slow — EPO OPS above is the replacement, not a fallback.
+
+**MongoDB — recommendation:** use a local container (`docker run -d -p 27017:27017 mongo`, `MONGODB_URI=mongodb://localhost:27017/patentpilot`) rather than Atlas. The README requires "instructions for running the project locally" — whoever reviews this take-home needs to `git clone` and run it without your personal Atlas credentials. A local Docker Mongo is genuinely self-contained: no account, no key, no shared-cluster surprises. Use Atlas only if you specifically want a persistent cloud dataset across your own dev sessions — but then keep your connection string out of the repo (`.env`, gitignored) and document the Docker path as the reviewer-facing default in the README.
 
 ## 12. Non-Functional Requirements
 
-- **Rate limiting:** throttle/queue outbound calls to PubChem, SureChEMBL, and PatentsView to respect their free-tier limits; retry with backoff on 429s.
+- **Rate limiting:** throttle/queue outbound calls to PubChem, SureChEMBL, and EPO OPS to respect their free-tier limits (OPS: 3.5 GB/week fair-use); retry with backoff on 429s.
 - **Caching:** patents cached by patent number in MongoDB — a repeat query for a related molecule reuses already-fetched patent metadata.
 - **Graceful degradation:** if one external source is down, return partial results and clearly flag which source failed rather than failing the whole request.
 - **Cost/latency control:** Chain A only runs on the top-K pre-scored candidates, not every retrieved patent — keeps LLM spend and response time bounded regardless of how many raw candidates come back.
@@ -246,23 +257,23 @@ Report {                          // Chain B output, per query
 ## 13. Assumptions
 
 - Input is a valid small-molecule organic SMILES (not biologics/peptides/large macromolecules).
-- Free-tier public API coverage (PubChem, SureChEMBL, PatentsView) is sufficient for an initial screening tool — not a substitute for a paid, comprehensive patent database in production use.
-- English-language patents only, given the chosen APIs' coverage.
-- PatentsView's US-centric coverage is an acceptable initial scope; non-US patent coverage is a future improvement.
+- Free-tier public API coverage (PubChem, SureChEMBL, EPO OPS) is sufficient for an initial screening tool — not a substitute for a paid, comprehensive patent database in production use.
+- OPS's 3.5 GB/week fair-use quota is sufficient at this scale; production use would need the paid OPS tier or a dedicated data license.
+- Patent text coverage follows EPO/INPADOC family data — strong across US/EP/WO and major offices, but not exhaustive of every national patent office.
 
 ## 14. Trade-offs
 
-- **PubChem/SureChEMBL/PatentsView over Google Patents scraping** — avoids ToS risk and scraping fragility, at the cost of narrower full-text patent coverage (PatentsView is US-focused).
+- **PubChem/SureChEMBL/EPO OPS over Google Patents scraping** — avoids ToS risk and scraping fragility. Also sidesteps USPTO ODP's ID.me identity-verification requirement, which blocks international users without a passport.
 - **PubChem-hosted fingerprint similarity over local RDKit** — faster to ship, zero extra service/dependency, keeps the stack pure MERN, but less chemically nuanced than a full local substructure/scaffold analysis.
 - **LLM analysis limited to top-K patents** — bounds cost and latency, at the cost of not generating a per-patent AI explanation for every low-relevance candidate (acceptable since those are, by construction, the least relevant).
 - **Deterministic scoring feeding the LLM, rather than LLM-decided recommendation** — sacrifices some flexibility for auditability; every recommendation is explainable by a fixed formula, not a black-box judgment call.
 
 ## 15. Build Plan (execution order)
 
-0. **Request PatentsView API key immediately** (before anything else) — issuance isn't always instant, and everything in Phase 3 blocks on it.
+0. **Register a free EPO OPS developer account** (before anything else) — `developers.epo.org/user/register`, "Non-paying" access, email confirmation, then generate a Consumer Key + Secret under My Apps. No ID verification, but email confirmation can take a few minutes — do it first.
 1. **Scaffold** — repo structure (`client/`, `server/`), Express server, MongoDB connection, React app shell with routing (Submit → Review → Report → History), `.env.example`.
 2. **Molecule submission + PubChem integration** — SMILES validation, CID lookup, canonicalization.
-3. **Patent retrieval** — SureChEMBL structural search + PatentsView keyword search, merge/dedupe, cache in MongoDB.
+3. **Patent retrieval** — SureChEMBL structural search + EPO OPS keyword search, merge/dedupe, cache in MongoDB.
 4. **Scoring** — compute structural/semantic/keyword/recency scores, composite score; render ranked list in Review Workspace.
 5. **AI per-patent analysis** — LangChain Chain A, structured JSON output, wired into the workspace UI.
 6. **Report generation** — LangChain Chain B, deterministic recommendation computation, Report view.
@@ -280,7 +291,7 @@ Report {                          // Chain B output, per query
 
 ## 17. Future Improvements
 
-- Add non-US/EPO patent coverage (e.g., via Lens.org's free tier) to reduce US-centric bias.
+- Add USPTO ODP as a supplementary source for anyone on the team who can complete ID.me verification, to cross-check EPO/INPADOC results against native USPTO data.
 - Local RDKit-based substructure/scaffold matching for chemically deeper structural analysis.
 - Claim-level text extraction (not just title/abstract) for higher-precision overlap analysis.
 - Batch/portfolio mode — submit multiple molecules from a series and compare risk profiles.

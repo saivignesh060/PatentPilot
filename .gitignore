@@ -1,3 +1,6 @@
+# Environment (NEVER commit this — contains API keys)
+.env
+
 # Dependencies
 node_modules/
 .pnp
