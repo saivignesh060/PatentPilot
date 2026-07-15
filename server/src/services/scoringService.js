@@ -6,11 +6,17 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import PatentScore from '../models/PatentScore.js';
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// Lazy-init so dotenv has run before we read the key
+function getGenAI() {
+  const key = process.env.GEMINI_API_KEY?.trim();
+  if (!key) throw new Error('GEMINI_API_KEY is not set in .env');
+  return new GoogleGenerativeAI(key);
+}
 
 // ── Embeddings ────────────────────────────────────────────────────────────────
 export async function getEmbedding(text) {
-  const model = genAI.getGenerativeModel({ model: process.env.EMBEDDING_MODEL || 'gemini-embedding-2' });
+  const modelName = process.env.EMBEDDING_MODEL || 'gemini-embedding-2';
+  const model = getGenAI().getGenerativeModel({ model: modelName });
   const result = await model.embedContent(text);
   return result.embedding.values;
 }

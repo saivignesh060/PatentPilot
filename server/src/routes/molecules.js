@@ -54,6 +54,7 @@ router.post('/', async (req, res, next) => {
         const synonyms = await getPubChemSynonyms(resolved.cid);
         const { patents, errors } = await runRetrievalPipeline({
           canonicalSmiles: resolved.canonicalSmiles,
+          cid: resolved.cid,
           target, indication, synonyms,
         });
 

@@ -4,17 +4,19 @@
  * Uses gemini-3.1-flash-lite via @langchain/google-genai
  */
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
-import { StructuredOutputParser } from 'langchain/output_parsers';
+import { StructuredOutputParser } from '@langchain/core/output_parsers';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { z } from 'zod';
 import Analysis from '../models/Analysis.js';
 
-// ── LLM instance ──────────────────────────────────────────────────────────────
+// ── LLM instance (lazy — reads env after dotenv) ─────────────────────────────
 function getLLM() {
+  const key = process.env.GEMINI_API_KEY?.trim();
+  if (!key) throw new Error('GEMINI_API_KEY is not set in .env');
   return new ChatGoogleGenerativeAI({
-    model:       process.env.LLM_MODEL || 'gemini-3.1-flash-lite',
-    apiKey:      process.env.GEMINI_API_KEY,
-    temperature: 0.1,  // low temp for factual, grounded output
+    model:           process.env.LLM_MODEL || 'gemini-3.1-flash-lite',
+    apiKey:          key,
+    temperature:     0.1,
     maxOutputTokens: 1024,
   });
 }

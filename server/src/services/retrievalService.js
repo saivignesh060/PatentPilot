@@ -1,236 +1,268 @@
 /**
  * retrievalService.js
- * Hybrid retrieval: PubChem structural → SureChEMBL mapping + EPO OPS keyword
- * Returns a merged, deduped array of patent candidates.
+ * Hybrid retrieval:
+ *   Structural → PubChem fastsimilarity_2d → PubChem patent xrefs (/xrefs/PatentID)
+ *   Keyword    → EPO OPS CQL search (skipped gracefully if keys not set)
+ * No SureChEMBL — their public REST API was discontinued.
  */
 import axios from 'axios';
 import Bottleneck from 'bottleneck';
 import Patent from '../models/Patent.js';
 
-// ── Rate limiters (respect free-tier limits) ──────────────────────────────────
-const pubchemLimiter = new Bottleneck({ minTime: 300 });   // ~3 req/s
-const surechemblLimiter = new Bottleneck({ minTime: 500 }); // ~2 req/s
-const epoLimiter = new Bottleneck({ minTime: 500 });        // ~2 req/s
+// ── Rate limiters ─────────────────────────────────────────────────────────────
+const pubchemLimiter = new Bottleneck({ minTime: 400, maxConcurrent: 3 });
+const epoLimiter     = new Bottleneck({ minTime: 500, maxConcurrent: 2 });
 
 // ── EPO OPS OAuth2 token cache ────────────────────────────────────────────────
-let epoToken = null;
-let epoTokenExpiry = 0;
+let _epoToken = null;
+let _epoTokenExpiry = 0;
 
 async function getEpoToken() {
-  if (epoToken && Date.now() < epoTokenExpiry - 60000) return epoToken;
-  const key = process.env.EPO_OPS_CONSUMER_KEY;
-  const secret = process.env.EPO_OPS_CONSUMER_SECRET;
-  if (!key || !secret) throw new Error('EPO_OPS_CONSUMER_KEY/SECRET not set in .env');
-  const credentials = Buffer.from(`${key}:${secret}`).toString('base64');
-  const resp = await axios.post(
-    'https://ops.epo.org/3.2/auth/accesstoken',
-    'grant_type=client_credentials',
-    {
-      headers: {
-        Authorization: `Basic ${credentials}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-    }
-  );
-  epoToken = resp.data.access_token;
-  epoTokenExpiry = Date.now() + resp.data.expires_in * 1000;
-  return epoToken;
+  if (_epoToken && Date.now() < _epoTokenExpiry - 60000) return _epoToken;
+  const key    = process.env.EPO_OPS_CONSUMER_KEY?.trim();
+  const secret = process.env.EPO_OPS_CONSUMER_SECRET?.trim();
+  if (!key || !secret) return null; // graceful — no keys yet
+  try {
+    const creds = Buffer.from(`${key}:${secret}`).toString('base64');
+    const resp  = await axios.post(
+      'https://ops.epo.org/3.2/auth/accesstoken',
+      'grant_type=client_credentials',
+      { headers: { Authorization: `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    _epoToken       = resp.data.access_token;
+    _epoTokenExpiry = Date.now() + resp.data.expires_in * 1000;
+    return _epoToken;
+  } catch (err) {
+    console.warn('[EPO OPS] Token fetch failed:', err.message);
+    return null;
+  }
 }
 
-// ── 1. PubChem: validate SMILES + get CID + synonyms ─────────────────────────
+// ── PubChem helpers ───────────────────────────────────────────────────────────
+
+/** Validate SMILES + return canonical form + CID */
 export async function resolveSMILES(smiles) {
-  const encoded = encodeURIComponent(smiles);
-  const url = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/${encoded}/property/IsomericSMILES,CanonicalSMILES,IUPACName,MolecularFormula/JSON`;
+  const enc  = encodeURIComponent(smiles.trim());
+  const url  = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/${enc}/property/IsomericSMILES,CanonicalSMILES,IUPACName,MolecularFormula/JSON`;
   const resp = await pubchemLimiter.schedule(() => axios.get(url, { timeout: 15000 }));
-  const props = resp.data.PropertyTable?.Properties?.[0];
+  const props = resp.data?.PropertyTable?.Properties?.[0];
   if (!props) throw new Error('PubChem could not parse this SMILES string.');
   return {
-    cid: String(props.CID),
+    cid:             String(props.CID),
     canonicalSmiles: props.CanonicalSMILES,
-    iupacName: props.IUPACName,
-    molecularFormula: props.MolecularFormula,
+    iupacName:       props.IUPACName || '',
+    molecularFormula: props.MolecularFormula || '',
   };
 }
 
+/** Top-10 synonyms for keyword building */
 export async function getPubChemSynonyms(cid) {
   try {
-    const url = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/${cid}/synonyms/JSON`;
+    const url  = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/${cid}/synonyms/JSON`;
     const resp = await pubchemLimiter.schedule(() => axios.get(url, { timeout: 10000 }));
-    const syns = resp.data.InformationList?.Information?.[0]?.Synonym || [];
-    return syns.slice(0, 10); // top 10 synonyms for keyword queries
-  } catch {
-    return [];
-  }
+    const syns = resp.data?.InformationList?.Information?.[0]?.Synonym || [];
+    // filter to short, useful names (skip InChI, SMILES-like strings, very long names)
+    return syns
+      .filter(s => s.length < 60 && !s.startsWith('InChI') && !s.includes('='))
+      .slice(0, 10);
+  } catch { return []; }
 }
 
-// ── 2. PubChem: 2D fingerprint similarity search ─────────────────────────────
+/** PubChem 2D fingerprint similarity → list of similar CIDs above threshold */
 export async function getPubChemSimilarCIDs(canonicalSmiles, threshold = 85) {
   try {
-    const encoded = encodeURIComponent(canonicalSmiles);
-    const url = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/fastsimilarity_2d/smiles/${encoded}/cids/JSON?Threshold=${threshold}&MaxRecords=50`;
+    const enc  = encodeURIComponent(canonicalSmiles);
+    const url  = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/fastsimilarity_2d/smiles/${enc}/cids/JSON?Threshold=${threshold}&MaxRecords=30`;
     const resp = await pubchemLimiter.schedule(() => axios.get(url, { timeout: 20000 }));
-    return resp.data.IdentifierList?.CID?.map(String) || [];
-  } catch {
-    return [];
-  }
-}
-
-// ── 3. SureChEMBL: CID/SMILES → patent mapping ───────────────────────────────
-export async function getSureChEMBLPatents(smiles) {
-  try {
-    const encoded = encodeURIComponent(smiles);
-    const url = `https://www.surechembl.org/api/search?q=${encoded}&format=json&limit=50`;
-    const resp = await surechemblLimiter.schedule(() =>
-      axios.get(url, { timeout: 20000, headers: { Accept: 'application/json' } })
-    );
-    const hits = resp.data?.results || resp.data?.hits || [];
-    return hits.map((h) => ({
-      patentNumber: h.patent_id || h.patent_number || h.id,
-      title:        h.title || h.patent_title || '',
-      abstract:     h.abstract || '',
-      assigneeName: h.assignee || '',
-      publicationDate: h.publication_date || h.pub_date || '',
-      filingDate:   h.filing_date || '',
-      source:       'SureChEMBL',
-      url:          h.url || `https://www.surechembl.org/compound/${h.id}`,
-      tanimoto:     h.tanimoto || h.similarity || 0,
-    })).filter((p) => p.patentNumber);
+    return (resp.data?.IdentifierList?.CID || []).map(String);
   } catch (err) {
-    console.warn('[SureChEMBL] retrieval failed:', err.message);
+    console.warn('[PubChem] Similarity search failed:', err.message);
     return [];
   }
 }
 
-// ── 4. EPO OPS: keyword search ────────────────────────────────────────────────
-export async function getEPOPatents(terms) {
-  if (!terms.length) return [];
+/**
+ * PubChem patent xrefs — structure-to-patent mapping (free, no key).
+ * Returns up to `limit` patent IDs for a given CID.
+ * Assigns an estimated tanimoto score based on whether the CID is the query itself (1.0) or similar (0.87).
+ */
+export async function getPubChemPatentsForCID(cid, queryCid, estimatedTanimoto = 0.87) {
   try {
-    const token = await getEpoToken();
-    // Build CQL query from up to 5 terms
-    const cqlTerms = terms
-      .slice(0, 5)
-      .map((t) => `ti="${t}" OR ab="${t}"`)
-      .join(' OR ');
-    const url = `https://ops.epo.org/3.2/rest-services/published-data/search`;
+    const url  = `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/${cid}/xrefs/PatentID/JSON`;
+    const resp = await pubchemLimiter.schedule(() => axios.get(url, { timeout: 15000 }));
+    const ids  = resp.data?.InformationList?.Information?.[0]?.PatentID || [];
+    const tanimoto = cid === queryCid ? 1.0 : estimatedTanimoto;
+    return ids.slice(0, 20).map(id => ({ patentNumber: id.replace(/\s+/g, ''), tanimoto, source: 'PubChem', cid }));
+  } catch { return []; }
+}
+
+// ── EPO OPS helpers ───────────────────────────────────────────────────────────
+
+/** Keyword search via EPO OPS CQL — skipped if no token */
+export async function getEPOPatents(terms) {
+  const token = await getEpoToken();
+  if (!token) return []; // graceful degradation
+
+  const cleanTerms = terms.filter(Boolean).slice(0, 5);
+  if (!cleanTerms.length) return [];
+
+  try {
+    const cql  = cleanTerms.map(t => `ti="${t}" OR ab="${t}"`).join(' OR ');
     const resp = await epoLimiter.schedule(() =>
-      axios.get(url, {
+      axios.get('https://ops.epo.org/3.2/rest-services/published-data/search', {
         timeout: 20000,
-        params: { q: cqlTerms, Range: '1-25' },
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: 'application/json',
-        },
+        params: { q: cql, Range: '1-25' },
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
       })
     );
-    const entries = resp.data?.['ops:world-patent-data']?.['ops:biblio-search']?.['ops:search-result']?.['ops:publication-reference'] || [];
+    const entries = resp.data?.['ops:world-patent-data']
+      ?.['ops:biblio-search']?.['ops:search-result']?.['ops:publication-reference'] || [];
     const list = Array.isArray(entries) ? entries : [entries];
-    return list.map((e) => {
-      const docId = e?.['document-id'];
-      const country = docId?.country?.['$'] || '';
-      const docNum  = docId?.['doc-number']?.['$'] || '';
-      const kind    = docId?.kind?.['$'] || '';
-      return {
-        patentNumber: `${country}${docNum}${kind}`,
-        title:        '',
-        abstract:     '',
-        assigneeName: '',
-        publicationDate: docId?.date?.['$'] || '',
-        filingDate:   '',
-        source:       'EPO_OPS',
-        url:          `https://worldwide.espacenet.com/patent/search/family/search?q=${country}${docNum}`,
-        tanimoto:     0,
-      };
-    }).filter((p) => p.patentNumber && p.patentNumber.length > 2);
+    return list
+      .map(e => {
+        const d = e?.['document-id'];
+        const country = d?.country?.['$'] || '';
+        const docNum  = d?.['doc-number']?.['$'] || '';
+        const kind    = d?.kind?.['$'] || '';
+        const date    = d?.date?.['$'] || '';
+        return {
+          patentNumber: `${country}-${docNum}-${kind}`.replace(/--/, '-'),
+          publicationDate: date,
+          source: 'EPO_OPS',
+          tanimoto: 0,
+          url: `https://worldwide.espacenet.com/patent/search?q=${country}${docNum}`,
+        };
+      })
+      .filter(p => p.patentNumber.length > 3);
   } catch (err) {
-    console.warn('[EPO OPS] retrieval failed:', err.message);
+    console.warn('[EPO OPS] Search failed:', err.message);
     return [];
   }
 }
 
-// ── 5. Fetch full patent metadata for EPO candidates ─────────────────────────
-export async function enrichEPOPatent(patentNumber) {
+/** Enrich a patent with title + abstract from EPO OPS biblio */
+export async function enrichPatentWithEPO(patentNumber, token) {
+  if (!token) return {};
   try {
-    const token = await getEpoToken();
-    const url = `https://ops.epo.org/3.2/rest-services/published-data/publication/epodoc/${patentNumber}/biblio`;
-    const resp = await epoLimiter.schedule(() =>
+    // EPO OPS uses epodoc format: country+number without hyphens
+    const epodoc = patentNumber.replace(/-/g, '');
+    const url    = `https://ops.epo.org/3.2/rest-services/published-data/publication/epodoc/${epodoc}/biblio`;
+    const resp   = await epoLimiter.schedule(() =>
       axios.get(url, {
         timeout: 15000,
         headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
       })
     );
-    const bib = resp.data?.['ops:world-patent-data']?.['exchange-documents']?.['exchange-document'];
+    const bib = resp.data?.['ops:world-patent-data']
+      ?.['exchange-documents']?.['exchange-document'];
     if (!bib) return {};
-    const inv = bib?.['bibliographic-data']?.['invention-title'];
-    const title = Array.isArray(inv)
-      ? (inv.find((t) => t?.['@lang'] === 'en')?.['$'] || inv[0]?.['$'] || '')
-      : (inv?.['$'] || '');
+
+    const invTitle = bib?.['bibliographic-data']?.['invention-title'];
+    const title = Array.isArray(invTitle)
+      ? (invTitle.find(t => t?.['@lang'] === 'en')?.['$'] || invTitle[0]?.['$'] || '')
+      : (invTitle?.['$'] || '');
+
     const abstObj = bib?.abstract;
     const abstract = Array.isArray(abstObj)
-      ? (abstObj.find((a) => a?.['@lang'] === 'en')?.p?.['$'] || '')
+      ? (abstObj.find(a => a?.['@lang'] === 'en')?.p?.['$'] || '')
       : (abstObj?.p?.['$'] || '');
-    return { title, abstract };
-  } catch {
-    return {};
-  }
+
+    const assignees = bib?.['bibliographic-data']?.parties?.assignees?.assignee;
+    const assignee  = Array.isArray(assignees)
+      ? assignees[0]?.['applicant-name']?.name?.['$'] || ''
+      : assignees?.['applicant-name']?.name?.['$'] || '';
+
+    return { title, abstract, assigneeName: assignee };
+  } catch { return {}; }
 }
 
 // ── Main pipeline ─────────────────────────────────────────────────────────────
-export async function runRetrievalPipeline({ canonicalSmiles, target, indication, synonyms }) {
-  const results = { surechembl: [], epo: [], errors: [] };
+export async function runRetrievalPipeline({ canonicalSmiles, target, indication, synonyms, cid }) {
+  const errors = [];
 
-  // Parallel fetch
-  const [surechemblPatents, epoPatents] = await Promise.allSettled([
-    getSureChEMBLPatents(canonicalSmiles),
-    getEPOPatents([target, indication, ...synonyms].filter(Boolean)),
-  ]);
+  // ── 1. PubChem structural path ────────────────────────────────────────────
+  let structuralPatents = [];
+  try {
+    // Get similar CIDs (threshold 85%)
+    const similarCIDs = await getPubChemSimilarCIDs(canonicalSmiles, 85);
+    // Include the query CID itself
+    const cidsToCheck = [...new Set([cid, ...similarCIDs])].slice(0, 15);
 
-  if (surechemblPatents.status === 'fulfilled') {
-    results.surechembl = surechemblPatents.value;
-  } else {
-    results.errors.push({ source: 'SureChEMBL', error: surechemblPatents.reason?.message });
+    console.log(`[Retrieval] Checking ${cidsToCheck.length} similar CIDs for patent xrefs…`);
+
+    // Get patent IDs for each CID in parallel (rate-limited)
+    const patentGroups = await Promise.all(
+      cidsToCheck.map((c, idx) => {
+        // Estimate tanimoto: query CID = 1.0, others decay slightly by rank
+        const est = c === cid ? 1.0 : Math.max(0.85, 0.97 - idx * 0.01);
+        return getPubChemPatentsForCID(c, cid, est);
+      })
+    );
+    structuralPatents = patentGroups.flat();
+    console.log(`[Retrieval] PubChem xrefs: ${structuralPatents.length} raw patent links`);
+  } catch (err) {
+    errors.push({ source: 'PubChem', error: err.message });
+    console.error('[Retrieval] PubChem structural path failed:', err.message);
   }
-  if (epoPatents.status === 'fulfilled') {
-    results.epo = epoPatents.value;
+
+  // ── 2. EPO OPS keyword path (graceful — skipped if no keys) ───────────────
+  let keywordPatents = [];
+  const epoToken = await getEpoToken();
+  if (epoToken) {
+    try {
+      const terms = [target, indication, ...synonyms.slice(0, 3)].filter(Boolean);
+      keywordPatents = await getEPOPatents(terms);
+      console.log(`[Retrieval] EPO OPS keyword: ${keywordPatents.length} patents`);
+    } catch (err) {
+      errors.push({ source: 'EPO_OPS', error: err.message });
+    }
   } else {
-    results.errors.push({ source: 'EPO_OPS', error: epoPatents.reason?.message });
+    console.log('[Retrieval] EPO OPS skipped — keys not configured yet');
+    errors.push({ source: 'EPO_OPS', error: 'Keys not configured — add EPO_OPS_CONSUMER_KEY/SECRET to .env' });
   }
 
-  // Merge + dedupe by patentNumber
-  const seen = new Set();
-  const merged = [];
-  for (const p of [...results.surechembl, ...results.epo]) {
-    if (p.patentNumber && !seen.has(p.patentNumber)) {
-      seen.add(p.patentNumber);
-      merged.push(p);
+  // ── 3. Merge + dedupe by patentNumber ────────────────────────────────────
+  const seen   = new Map(); // patentNumber → best entry
+  for (const p of [...structuralPatents, ...keywordPatents]) {
+    if (!p.patentNumber) continue;
+    const existing = seen.get(p.patentNumber);
+    if (!existing || p.tanimoto > existing.tanimoto) {
+      seen.set(p.patentNumber, p);
     }
   }
+  const merged = Array.from(seen.values());
+  console.log(`[Retrieval] Merged unique patents: ${merged.length}`);
 
-  // Upsert into Patent cache
+  // ── 4. Enrich with EPO OPS biblio (title/abstract) if token available ────
   const cached = await Promise.all(
     merged.map(async (p) => {
       try {
+        // Try to enrich with EPO OPS
         let enriched = {};
-        if (p.source === 'EPO_OPS' && !p.title) {
-          enriched = await enrichEPOPatent(p.patentNumber);
+        if (epoToken && !p.title) {
+          enriched = await enrichPatentWithEPO(p.patentNumber, epoToken);
         }
+
+        // Upsert into Patent cache
         const doc = await Patent.findOneAndUpdate(
           { patentNumber: p.patentNumber },
           {
             $setOnInsert: {
               patentNumber:    p.patentNumber,
-              title:           enriched.title || p.title,
-              abstract:        enriched.abstract || p.abstract,
-              assigneeName:    p.assigneeName,
-              publicationDate: p.publicationDate,
-              filingDate:      p.filingDate,
-              source:          p.source,
-              url:             p.url,
+              title:           enriched.title || p.title || '',
+              abstract:        enriched.abstract || p.abstract || '',
+              assigneeName:    enriched.assigneeName || p.assigneeName || '',
+              publicationDate: p.publicationDate || extractDateFromPatentNumber(p.patentNumber),
+              filingDate:      p.filingDate || '',
+              source:          p.source || 'PubChem',
+              url:             p.url || buildPatentUrl(p.patentNumber),
             },
           },
           { upsert: true, new: true }
         );
         return { patent: doc, tanimoto: p.tanimoto || 0 };
-      } catch {
+      } catch (err) {
+        console.warn(`[Retrieval] Cache upsert failed for ${p.patentNumber}:`, err.message);
         return null;
       }
     })
@@ -238,6 +270,23 @@ export async function runRetrievalPipeline({ canonicalSmiles, target, indication
 
   return {
     patents: cached.filter(Boolean),
-    errors:  results.errors,
+    errors,
   };
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/** Try to extract a year from common patent number formats */
+function extractDateFromPatentNumber(pn) {
+  const m = pn.match(/\b(19|20)\d{2}\b/);
+  return m ? `${m[0]}0101` : '';
+}
+
+/** Build a viewer URL for a patent number */
+function buildPatentUrl(patentNumber) {
+  const clean = patentNumber.replace(/-/g, '');
+  if (clean.startsWith('US')) {
+    return `https://patents.google.com/patent/${clean}`;
+  }
+  return `https://worldwide.espacenet.com/patent/search?q=${encodeURIComponent(patentNumber)}`;
 }
