@@ -53,7 +53,9 @@ export default function WorkspacePage({ fromHistory = false }) {
 
   const status = molecule?.status;
   const patents = patentData?.patents || [];
-  const hasAnalysis = patents.some((p) => p.analysis);
+  const analysedCount = patents.filter((p) => p.analysis).length;
+  const hasAnalysis = analysedCount > 0;
+  const allAnalysed = hasAnalysis && analysedCount >= Math.min(patents.length, 15);
 
   return (
     <div className="fade-in">
@@ -87,7 +89,13 @@ export default function WorkspacePage({ fromHistory = false }) {
           )}
         </div>
 
-        <div style={{ display: 'flex', gap: 10 }}>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+          {analyzeTrigered && !allAnalysed && (
+            <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span className="spinner" style={{ width: 12, height: 12 }} />
+              Analysing {analysedCount}/{Math.min(patents.length, 15)} patents…
+            </span>
+          )}
           {status === 'ready' && !analyzeTrigered && (
             <button
               className="btn-ghost"
@@ -159,8 +167,8 @@ export default function WorkspacePage({ fromHistory = false }) {
               }}
             >
               <option value="">All Sources</option>
-              <option value="SureChEMBL">SureChEMBL</option>
-              <option value="EPO_OPS">EPO OPS</option>
+              <option value="PubChem">PubChem (Structural)</option>
+              <option value="EPO_OPS">EPO OPS (Keyword)</option>
             </select>
           </div>
         </div>

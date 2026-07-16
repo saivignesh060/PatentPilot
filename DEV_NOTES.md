@@ -171,26 +171,18 @@ d:\PatentPilot\
 
 ## Build Phases & Progress
 
-- [x] **Phase 0** — API keys collected, .env created, DEV_NOTES set up
-  - GEMINI_API_KEY: user will paste
-  - EPO_OPS keys: user registering at developers.epo.org
-  - MongoDB: local
-- [x] **Phase 1** — Scaffold complete
-  - `server/src/index.js` — Express + CORS + all routes mounted
-  - `server/src/db.js` — Mongoose connection
-  - `server/src/models/` — Query, Patent, PatentScore, Analysis, Report
-  - `server/src/services/retrievalService.js` — PubChem + SureChEMBL + EPO OPS
-  - `server/src/services/scoringService.js` — 4 components + composite + recommendation
-  - `server/src/services/aiService.js` — LangChain Chain A + Chain B
-  - `server/src/routes/` — molecules, patents, reports, history
-  - `client/` — React Vite app with 4 pages + PatentCard component + Axios client
-- [ ] **Phase 2** — Molecule submission + PubChem integration
-- [ ] **Phase 3** — Patent retrieval: SureChEMBL + EPO OPS, merge/dedupe, cache
-- [ ] **Phase 4** — Scoring: 4 components → composite; ranked list in Review Workspace
-- [ ] **Phase 5** — AI Chain A: per-patent LangChain analysis, wired to UI
-- [ ] **Phase 6** — Report: Chain B + deterministic recommendation, Report view
-- [ ] **Phase 7** — History: persistence + list/detail views
-- [ ] **Phase 8** — Polish: README, loading/error states, rate limiting, graceful degradation
+- [x] **Phase 0** — API keys, .env, DEV_NOTES
+- [x] **Phase 1** — Full scaffold (server + client)
+- [x] **Phase 2** — Molecule submission + PubChem validation (CID, canonical SMILES, IUPAC name)
+- [x] **Phase 3** — Patent retrieval
+  - PubChem fastsimilarity_2d → patent xrefs (replaced defunct SureChEMBL API)
+  - EPO OPS gracefully skipped if keys not set
+  - Merge + dedupe + MongoDB cache
+- [x] **Phase 4** — Scoring: 4 components + composite, ranked list, recency weighting
+- [x] **Phase 5** — Chain A: per-patent AI analysis wired, Gemini gemini-3.1-flash-lite ✅ TESTED
+- [x] **Phase 6** — Chain B: report generation + deterministic recommendation ✅ TESTED
+- [x] **Phase 7** — History: list + reopen cached reports ✅ TESTED
+- [ ] **Phase 8** — Polish: README, embedding scores when key works, EPO OPS integration when keys arrive
 
 ---
 
@@ -208,8 +200,11 @@ d:\PatentPilot\
 ## Session Log
 | Date | What was done |
 |---|---|
-| 2026-07-16 | Read PRD (v1 + updated v2), noted EPO OPS replaces PatentsView, confirmed models, created .env + .env.example + DEV_NOTES, Phase 0 complete |
-| 2026-07-16 | Phase 1 complete — full server + client scaffold, all 5 models, 3 services, 4 routes, 4 pages, PatentCard component, global CSS design system |
+| 2026-07-16 | Read PRD (v1+v2), setup GitHub, .env, DEV_NOTES |
+| 2026-07-16 | Phase 1: Full MERN scaffold — 5 models, 3 services, 4 routes, 4 pages |
+| 2026-07-16 | Phase 2-7 COMPLETE + TESTED end-to-end: Ibuprofen → 20 patents → scores → Chain A (3 analysed) → Chain B report (High Patent Risk) → History API |
+| 2026-07-16 | Bug fixes: SureChEMBL replaced with PubChem xrefs, dotenv path fixed, lazy API key loading, LangChain import paths fixed |
+| — | Phase 8: README + polish (next) |
 
 ---
 *Last updated: 2026-07-16*

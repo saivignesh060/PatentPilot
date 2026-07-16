@@ -109,11 +109,12 @@ flowchart LR
 |---|---|---|
 | **PubChem PUG REST** | SMILES validation, canonicalization, CID lookup, 2D fingerprint similarity search (`fastsimilarity_2d`) | Free, no key, offloads fingerprint/Tanimoto computation server-side — no need to run RDKit locally, keeps the stack pure Node. |
 | **SureChEMBL** | Structure-to-patent mapping — which patents disclose this or a similar structure | Purpose-built for exactly this: chemical structure → patent linkage. Primary structural-risk source. |
-| **EPO Open Patent Services (OPS)** | Keyword/full-text search on target, indication, molecule name/synonyms — via INPADOC family data | Free "Non-paying" tier (3.5 GB/week), catches patents that discuss the compound by name/mechanism without a deposited structure in SureChEMBL. Registration is a plain email/password form at `developers.epo.org` — no government ID or ID.me verification, unlike USPTO's Open Data Portal (which now requires ID.me identity verification, and a passport-based video call for anyone outside the US). Bonus: EPO/INPADOC coverage spans patent families across the US, EP, WO and other offices, so this is broader than a US-only source, not narrower. |
+| **PubChem `xrefs/PatentID`** | Direct compound→patent number cross-reference from PubChem's own aggregated patent-mining data | Free, no key, zero extra setup — supplements SureChEMBL with PubChem's own patent linkage for the same CID. |
+| **EPO Open Patent Services (OPS)** | Keyword/full-text search on target, indication, molecule name/synonyms — via INPADOC family data | Free "Non-paying" tier (3.5 GB/week), no ID.me/government ID. Broader coverage than a US-only source (US, EP, WO, and more via INPADOC family data). |
 
 **Pipeline**
 1. Resolve SMILES → canonical SMILES + CID (PubChem).
-2. Structural candidates: PubChem similarity search → cross-reference resulting CIDs against SureChEMBL structure search.
+2. Structural candidates: PubChem similarity search + `xrefs/PatentID` → cross-reference resulting CIDs against SureChEMBL structure search.
 3. Keyword candidates: EPO OPS CQL search (`ti=`, `ab=`, `pa=` fields) built from target + indication + any PubChem synonyms for the molecule.
 4. Merge both candidate sets, dedupe by patent number, fetch full metadata (title, abstract, assignee, date) for each.
 5. Score every candidate (Section 9) and return ranked list to the client.
@@ -270,7 +271,7 @@ Report {                          // Chain B output, per query
 
 ## 15. Build Plan (execution order)
 
-0. **Register a free EPO OPS developer account** (before anything else) — `developers.epo.org/user/register`, "Non-paying" access, email confirmation, then generate a Consumer Key + Secret under My Apps. No ID verification, but email confirmation can take a few minutes — do it first.
+0. ~~Register a free EPO OPS developer account~~ — **done**, Consumer Key + Secret in hand.
 1. **Scaffold** — repo structure (`client/`, `server/`), Express server, MongoDB connection, React app shell with routing (Submit → Review → Report → History), `.env.example`.
 2. **Molecule submission + PubChem integration** — SMILES validation, CID lookup, canonicalization.
 3. **Patent retrieval** — SureChEMBL structural search + EPO OPS keyword search, merge/dedupe, cache in MongoDB.
