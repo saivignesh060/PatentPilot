@@ -149,7 +149,9 @@ Runs once per query. Input is the **full set of Chain A outputs** (not raw paten
 
 Critically, the `recommendation` field is **computed programmatically before Chain B runs** and passed in as a fact to explain, not a decision for the LLM to make. This keeps every risk tier deterministic and auditable — every number in the report can be traced to a specific API response or embedding calculation.
 
-**Output schema:**
+The `recommendation` value (`"Low Patent Risk"` / `"Requires Expert Review"` / `"High Patent Risk"`) is stored in the Report document by the route handler after Chain B returns — it is **not** part of the LLM's output schema. Chain B only produces `recommendationRationale`: the plain-language explanation of why the scoring formula reached that tier.
+
+**Output schema (what the LLM returns):**
 ```json
 {
   "executiveSummary": "string (3–5 sentences, plain language)",
@@ -157,6 +159,18 @@ Critically, the `recommendation` field is **computed programmatically before Cha
   "noveltyConcerns": ["string"],
   "manualReviewPatents": [{ "patentNumber": "string", "reason": "string" }],
   "recommendationRationale": "string"
+}
+```
+
+**What gets stored in the Report document (LLM output + scoring service output merged):**
+```json
+{
+  "executiveSummary": "...",
+  "keySimilarPatents": [...],
+  "noveltyConcerns": [...],
+  "manualReviewPatents": [...],
+  "recommendationRationale": "...",
+  "recommendation": "High Patent Risk"
 }
 ```
 
@@ -192,7 +206,7 @@ Critically, the `recommendation` field is **computed programmatically before Cha
 
 | Decision | Trade-off |
 |---|---|
-| **PubChem patent xrefs over SureChEMBL** | SureChEMBL's public REST API was discontinued. PubChem's `/xrefs/PatentID` provides the same structural → patent linkage, completely free with no key. |
+| **PubChem patent xrefs over SureChEMBL** | SureChEMBL's query API returned 404 on all tested endpoints during the build window — their backend was mid-rebuild (SureChEMBL 2.0) and the live query API was unavailable at that time (though not permanently discontinued). PubChem's `xrefs/PatentID` was used instead: it provides direct compound→patent linkage, is always available, and requires no separate integration or key. This trades some structural-linkage depth (SureChEMBL's purpose-built chemistry-to-patent mapping) for reliability and simplicity within the build window. |
 | **EPO OPS over USPTO PatentsView/ODP** | USPTO's Open Data Portal now requires ID.me identity verification (passport video call for non-US users). EPO OPS requires only email registration and covers broader patent families via INPADOC. |
 | **PubChem-hosted fingerprint similarity over local RDKit** | Faster to ship, zero extra dependency, pure MERN stack — at the cost of less chemically nuanced analysis than full local scaffold/substructure matching. |
 | **LLM analysis limited to top-15 patents** | Bounds LLM cost and latency. Low-ranked patents are, by construction, the least relevant — skipping per-patent AI explanation for them is an acceptable trade-off. |
